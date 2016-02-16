@@ -1,0 +1,94 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+use File::Temp qw(tempfile);
+use Date::Parse;
+
+my %ncert;
+umask 0027;
+while (<DATA>) {
+  chomp;
+  s/\s*#.*//;
+  unless (/./) {
+    next;
+  }
+  my @d;
+  foreach my $ds (split /,/,$_) {
+    if ($ds =~ /(.*)\+$/) {
+      push @d,$1;
+      push @d,"www.$1";
+    } else {
+      push @d,$ds;
+    }
+  }
+  my $domain=$d[0];
+  if (-e "/etc/apache2/certs/$domain.crt") {
+    my $long=0;
+    open SSL,'-|',qw(openssl x509 -text -in),"/etc/apache2/certs/$domain.crt";
+    while (<SSL>) {
+      chomp;
+      if (/Not After\s*:\s*(.*)/) {
+        my $exp=str2time($1);
+        if ($exp-time>2592000) { # more than 30 days to run
+          $long=1;
+        }
+        last;
+      }
+    }
+    if ($long) {
+      next;
+    }
+  }
+  unless (-e "/etc/apache2/certs/$domain.key") {
+    system(qw(openssl genrsa -out),"/etc/apache2/certs/$domain.key",4096);
+  }
+  unless (-e "$domain.csr") {
+    if (scalar @d == 1) {
+      system(qw(openssl req -new -sha256 -key),"/etc/apache2/certs/$domain.key",'-subj',"/CN=$domain",'-out',"$domain.csr");
+    } else {
+      my ($ch,$cf)=tempfile;
+      open I,'<','/etc/ssl/openssl.cnf';
+      while (<I>) {
+        print $ch $_;
+      }
+      close I;
+      print $ch "[SAN]\n";
+      print $ch "subjectAltName=".join(',',map{"DNS:$_"} @d)."\n";
+      close $ch;
+      system(qw(openssl req -new -sha256 -key),"/etc/apache2/certs/$domain.key",qw(-subj / -reqexts SAN -config),$cf,'-out',"$domain.csr");
+      unlink $cf;
+    }
+  }
+  open ACME,'-|','python',"$ENV{HOME}/acme-tiny/acme_tiny.py",'--account-key',"$ENV{HOME}/account.key",'--csr',"$domain.csr",'--acme-dir','/var/www/challenges/';
+  my ($ch,$cf)=tempfile;
+  my $success=0;
+  while (<ACME>) {
+    $success=1;
+    print $ch $_;
+  }
+  close ACME;
+  if ($success) {
+    open I,'<','lets-encrypt-x1-cross-signed.pem';
+    while (<I>) {
+      print $ch $_;
+    }
+    close I;
+  }
+  close $ch;
+  if ($success) {
+    system(qw(chmod 644),$cf);
+    system('mv',$cf,"/etc/apache2/certs/$domain.crt");
+    $ncert{$domain}=1;
+    sleep 60;
+  } else {
+    unlink $cf;
+  }
+}
+
+if (%ncert) {
+  warn "Restart apache\n";
+  print join(', ',sort keys %ncert),"\n";
+}
+
+__DATA__
